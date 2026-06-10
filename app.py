@@ -1,133 +1,665 @@
-"""
-ComplaintIQ – AI-Powered Banking Complaint Resolution Assistant
-Main Streamlit application entry point.
-"""
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
+import faiss
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import streamlit as st
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
 
-# Page config — must be first Streamlit call
-st.set_page_config(
-    page_title="ComplaintIQ",
-    page_icon="🏦",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
-from tabs import knowledge_base, complaint_analysis, resolution_tracker, policy_chatbot
-from utils.session import init_session_state
-from utils.styles import apply_styles
+# -----------------------------------------------------------------------------
+# Helpers and runtime utilities
+# -----------------------------------------------------------------------------
 
-# Initialise session state
-init_session_state()
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_MODEL_CANDIDATES = ["qwen3", "qwen3:8b", "qwen3-8b", "qwen-3", "qwen-8b", "qwen"]
+COMPLAINT_CATEGORIES = [
+    "UPI",
+    "ATM",
+    "Debit Card",
+    "Credit Card",
+    "Internet Banking",
+    "Mobile Banking",
+    "Loan",
+    "KYC",
+    "Charges",
+    "Account Opening",
+    "Other",
+]
 
-# Inject custom CSS
-apply_styles()
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
-with st.sidebar:
+def get_available_ollama_model() -> Optional[str]:
+    try:
+        process = subprocess.run(
+            ["ollama", "ls"], capture_output=True, text=True, check=True
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.CalledProcessError:
+        return None
+
+    lines = [line.strip() for line in process.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    models = set()
+    for line in lines:
+        if line.startswith("NAME"):
+            continue
+        parts = re.split(r"\s+", line)
+        if parts:
+            models.add(parts[0])
+
+    for candidate in DEFAULT_MODEL_CANDIDATES:
+        if candidate in models:
+            return candidate
+    return next(iter(models), None)
+
+
+def run_ollama_generate(prompt: str, model_name: str, max_tokens: int = 512) -> str:
+    try:
+        args = ["ollama", "generate", model_name, "--prompt", prompt, "--max-tokens", str(max_tokens), "--temperature", "0.2"]
+        process = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return process.stdout.strip()
+    except FileNotFoundError:
+        raise RuntimeError("Ollama is not installed or not available in PATH.")
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Ollama generation failed: {exc.stderr.strip() or exc.stdout.strip()}")
+
+
+@st.cache_resource
+def load_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(EMBED_MODEL_NAME)
+
+
+def normalize_embeddings(vectors: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vectors / norms
+
+
+def initialize_session_state() -> None:
+    if "knowledge_base" not in st.session_state:
+        st.session_state.knowledge_base = {
+            "documents": [],
+            "chunks": [],
+            "metadata": [],
+            "index": None,
+            "vector_count": 0,
+            "model_name": None,
+        }
+    if "complaints" not in st.session_state:
+        st.session_state.complaints = []
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "feedback" not in st.session_state:
+        st.session_state.feedback = ""
+
+
+def split_text(text: str, chunk_size: int = 300, chunk_overlap: int = 50) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= chunk_size:
+        return [text]
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks = []
+    current_chunk = ""
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 <= chunk_size:
+            current_chunk = f"{current_chunk} {sentence}".strip()
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    if chunk_overlap > 0 and len(chunks) > 1:
+        merged_chunks = []
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                merged_chunks.append(chunk)
+            else:
+                overlap = " ".join(chunks[i - 1].split()[-chunk_overlap:])
+                merged_chunks.append(f"{overlap} {chunk}".strip())
+        chunks = merged_chunks
+
+    return chunks
+
+
+def extract_pdf_text(file_buffer: io.BytesIO) -> str:
+    reader = PdfReader(file_buffer)
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages).strip()
+
+
+def build_faiss_index(chunks: List[str]) -> Tuple[faiss.IndexFlatIP, np.ndarray]:
+    embedder = load_embedding_model()
+    embeddings = embedder.encode(chunks, convert_to_numpy=True, show_progress_bar=False)
+    embeddings = normalize_embeddings(embeddings)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+    return index, embeddings
+
+
+def update_knowledge_base(files: List[Any]) -> None:
+    knowledge_base = st.session_state.knowledge_base
+    all_chunks = []
+    metadata = []
+    documents = []
+
+    for uploaded in files:
+        try:
+            text = extract_pdf_text(uploaded)
+        except Exception as exc:
+            st.error(f"Failed to read {uploaded.name}: {exc}")
+            continue
+
+        if not text:
+            st.warning(f"Uploaded {uploaded.name} did not contain readable text.")
+            continue
+
+        documents.append(uploaded.name)
+        chunks = split_text(text)
+        for chunk_id, chunk_text in enumerate(chunks, start=1):
+            all_chunks.append(chunk_text)
+            metadata.append({
+                "source": uploaded.name,
+                "chunk_id": chunk_id,
+                "text": chunk_text,
+            })
+
+    if not all_chunks:
+        st.warning("No valid document text was processed.")
+        return
+
+    index, embeddings = build_faiss_index(all_chunks)
+    knowledge_base["documents"] = documents
+    knowledge_base["chunks"] = all_chunks
+    knowledge_base["metadata"] = metadata
+    knowledge_base["index"] = index
+    knowledge_base["vector_count"] = len(all_chunks)
+    st.success("Knowledge base updated with uploaded policy documents.")
+
+
+def clear_knowledge_base() -> None:
+    st.session_state.knowledge_base = {
+        "documents": [],
+        "chunks": [],
+        "metadata": [],
+        "index": None,
+        "vector_count": 0,
+        "model_name": st.session_state.knowledge_base.get("model_name"),
+    }
+    st.session_state.chat_history = []
+    st.success("Knowledge base cleared.")
+
+
+def is_kb_ready() -> bool:
+    return st.session_state.knowledge_base.get("index") is not None and len(st.session_state.knowledge_base.get("chunks", [])) > 0
+
+
+def retrieve_policy_chunks(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    if not is_kb_ready():
+        return []
+
+    embedder = load_embedding_model()
+    query_vector = embedder.encode([query], convert_to_numpy=True)
+    query_vector = normalize_embeddings(query_vector)
+    index = st.session_state.knowledge_base["index"]
+    scores, indices = index.search(query_vector, top_k)
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < 0 or idx >= len(st.session_state.knowledge_base["metadata"]):
+            continue
+        item = st.session_state.knowledge_base["metadata"][idx]
+        results.append({
+            "source": item["source"],
+            "text": item["text"],
+            "score": float(score),
+        })
+    return results
+
+
+def classify_complaint(complaint: str) -> str:
+    normalized = complaint.lower()
+    category_keywords = {
+        "UPI": ["upi", "unified payment interface", "bhim", "peer to peer payment"],
+        "ATM": ["atm", "cash dispenser", "withdraw", "not dispensing", "eject"],
+        "Debit Card": ["debit card", "atm card", "card blocked", "card declined"],
+        "Credit Card": ["credit card", "statement", "limit", "billing"],
+        "Internet Banking": ["internet banking", "net banking", "login", "password", "say bank"],
+        "Mobile Banking": ["mobile banking", "app", "mobile app", "OTP", "mPIN"],
+        "Loan": ["loan", "EMI", "interest rate", "disbursement"],
+        "KYC": ["kyc", "know your customer", "document", "address proof"],
+        "Charges": ["charge", "fee", "deducted", "penalty"],
+        "Account Opening": ["account opening", "new account", "account number", "savings account"],
+    }
+    for category, keywords in category_keywords.items():
+        for keyword in keywords:
+            if keyword in normalized:
+                return category
+    return "Other"
+
+
+def generate_complaint_summary(complaint: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+", complaint.strip())
+    if len(sentences) <= 2:
+        return complaint.strip()
+    return " ".join(sentences[:2])
+
+
+def parse_json_response(response: str) -> Dict[str, Any]:
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        # Attempt to extract JSON block from response text
+        json_match = re.search(r"\{.*\}", response, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+    return {}
+
+
+def compose_complaint_prompt(
+    complaint: str, retrieved_chunks: List[Dict[str, Any]], category_hint: str
+) -> str:
+    chunks_text = "\n\n".join(
+        [f"[{idx + 1}] Source: {chunk['source']}\n{chunk['text']}" for idx, chunk in enumerate(retrieved_chunks)]
+    )
+    prompt = (
+        "You are a banking policy assistant. Based on the customer complaint and the policy excerpts below, respond in valid JSON. "
+        "Use source numbers for citations."
+        "\n\nComplaint:\n" + complaint + "\n\n"
+        "Policy excerpts:\n" + chunks_text + "\n\n"
+        "Produce an object with these keys:\n"
+        "summary, category, suggested_resolution, next_actions, confidence_score, cited_sources.\n"
+        "- summary: a short complaint summary.\n"
+        "- category: one of UPI, ATM, Debit Card, Credit Card, Internet Banking, Mobile Banking, Loan, KYC, Charges, Account Opening, Other.\n"
+        "- suggested_resolution: a concise policy-based resolution.\n"
+        "- next_actions: actionable steps for the banking operations team.\n"
+        "- confidence_score: a number between 0 and 100.\n"
+        "- cited_sources: a list of source reference numbers from the policy excerpts.\n\n"
+        "If the complaint falls into one of the listed categories, use that category; otherwise use 'Other'.\n"
+        "Category hint: "
+        + category_hint
+    )
+    return prompt
+
+
+def analyze_complaint(complaint: str) -> Dict[str, Any]:
+    if not complaint.strip():
+        raise ValueError("Complaint text cannot be empty.")
+    if not is_kb_ready():
+        raise RuntimeError("The knowledge base is not ready. Upload policies first.")
+
+    category_hint = classify_complaint(complaint)
+    summary = generate_complaint_summary(complaint)
+    retrieved_chunks = retrieve_policy_chunks(complaint, top_k=3)
+    if not retrieved_chunks:
+        raise RuntimeError("No relevant policy chunks were retrieved from the knowledge base.")
+
+    prompt = compose_complaint_prompt(complaint, retrieved_chunks, category_hint)
+    model_name = st.session_state.knowledge_base.get("model_name") or "unknown"
+    answer = run_ollama_generate(prompt, model_name, max_tokens=450)
+    parsed = parse_json_response(answer)
+    result = {
+        "summary": parsed.get("summary", summary),
+        "category": parsed.get("category", category_hint),
+        "suggested_resolution": parsed.get("suggested_resolution", "No resolution could be generated."),
+        "next_actions": parsed.get("next_actions", "Review the policy excerpts and follow standard resolution steps."),
+        "confidence_score": parsed.get("confidence_score", "N/A"),
+        "cited_sources": parsed.get("cited_sources", []),
+        "retrieved_chunks": retrieved_chunks,
+    }
+    return result
+
+
+def compose_chatbot_prompt(question: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
+    chunks_text = "\n\n".join(
+        [f"[{idx + 1}] Source: {chunk['source']}\n{chunk['text']}" for idx, chunk in enumerate(retrieved_chunks)]
+    )
+    prompt = (
+        "You are a banking policy assistant. Answer the user question using only the policy excerpts below. "
+        "If the answer is not in the excerpts, respond that you do not have enough information. "
+        "Use source numbers in parentheses to cite relevant excerpts.\n\n"
+        "Question:\n" + question + "\n\n"
+        "Policy excerpts:\n" + chunks_text + "\n\n"
+        "Provide a clear answer and cite sources like (1), (2)."
+    )
+    return prompt
+
+
+def add_chat_history(question: str, answer: str, sources: List[str]) -> None:
+    st.session_state.chat_history.append(
+        {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "question": question,
+            "answer": answer,
+            "sources": sources,
+        }
+    )
+
+
+# -----------------------------------------------------------------------------
+# UI sections
+# -----------------------------------------------------------------------------
+
+
+def render_header() -> None:
+    st.title("ComplaintIQ — AI-Powered Banking Complaint Resolution Assistant")
     st.markdown(
-        """
-        <div style='text-align:center; padding: 1rem 0 0.5rem;'>
-            <span style='font-size:2.4rem;'>🏦</span>
-            <h2 style='margin:0.2rem 0 0; letter-spacing:-0.5px;'>ComplaintIQ</h2>
-            <p style='color:var(--muted); font-size:0.78rem; margin:0;'>
-                AI-Powered Banking Complaint Resolution
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        "Streamlit app for local RAG-powered policy retrieval, complaint analytics, and interactive complaint tracking. "
+        "Uses FAISS, sentence-transformers embeddings, and a local Ollama model."
     )
-    st.divider()
 
-    # Knowledge base status
-    kb = st.session_state.get("kb_stats", {})
-    total_docs   = kb.get("total_docs", 0)
-    total_chunks = kb.get("total_chunks", 0)
 
-    status_color = "#22c55e" if total_docs > 0 else "#f59e0b"
-    status_text  = "Ready" if total_docs > 0 else "No documents loaded"
-
+def tab_knowledge_base() -> None:
+    st.header("Knowledge Base Management")
     st.markdown(
-        f"""
-        <div style='background:var(--card-bg); border-radius:10px; padding:0.8rem 1rem; margin-bottom:0.5rem;'>
-            <div style='display:flex; align-items:center; gap:0.5rem;'>
-                <span style='color:{status_color}; font-size:0.7rem;'>●</span>
-                <span style='font-size:0.78rem; font-weight:600;'>Knowledge Base</span>
-            </div>
-            <div style='font-size:0.72rem; color:var(--muted); margin-top:0.3rem;'>
-                {status_text}<br/>
-                {total_docs} doc{"s" if total_docs != 1 else ""} · {total_chunks} chunks
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        "Upload banking policy or complaint resolution PDFs here. The app will extract text, create embeddings, and build a local FAISS knowledge base."
     )
 
-    # Complaint summary
-    complaints = st.session_state.get("complaints", [])
-    pending    = sum(1 for c in complaints if c["status"] == "Pending")
-    completed  = sum(1 for c in complaints if c["status"] == "Completed")
-    rejected   = sum(1 for c in complaints if c["status"] == "Rejected")
+    with st.expander("Upload new policy documents"):
+        uploaded_files = st.file_uploader(
+            "Select PDF files", type=["pdf"], accept_multiple_files=True, help="Upload policy or procedure documents."
+        )
+        if st.button("Build / Update Knowledge Base"):
+            if not uploaded_files:
+                st.warning("Please upload at least one PDF document before building the knowledge base.")
+            else:
+                update_knowledge_base(uploaded_files)
 
+    if st.button("Clear Knowledge Base"):
+        clear_knowledge_base()
+
+    knowledge_base = st.session_state.knowledge_base
+    st.subheader("Knowledge Base Status")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Uploaded Documents", len(knowledge_base["documents"]))
+    col2.metric("Chunks Created", len(knowledge_base["chunks"]))
+    col3.metric("Vectors Stored", knowledge_base["vector_count"])
+
+    if knowledge_base["documents"]:
+        st.subheader("Uploaded Documents")
+        st.write(
+            pd.DataFrame(
+                {"Document Name": knowledge_base["documents"]}
+            )
+        )
+    else:
+        st.info("No policy documents have been uploaded yet.")
+
+    model_name = knowledge_base.get("model_name")
+    st.sidebar.markdown("### Local Model Status")
+    if model_name:
+        st.sidebar.success(f"Using Ollama model: {model_name}")
+    else:
+        st.sidebar.warning("Ollama model not detected yet. Please restart after installing Ollama and a local model.")
+
+
+def write_complaint_record(record: Dict[str, Any]) -> None:
+    st.session_state.complaints.append(record)
+
+
+def tab_complaint_analysis() -> None:
+    st.header("Complaint Analysis")
     st.markdown(
-        f"""
-        <div style='background:var(--card-bg); border-radius:10px; padding:0.8rem 1rem;'>
-            <div style='font-size:0.78rem; font-weight:600; margin-bottom:0.4rem;'>Complaints</div>
-            <div style='display:flex; justify-content:space-between; font-size:0.72rem;'>
-                <span>Total</span><span style='font-weight:600;'>{len(complaints)}</span>
-            </div>
-            <div style='display:flex; justify-content:space-between; font-size:0.72rem;'>
-                <span style='color:#f59e0b;'>Pending</span><span style='color:#f59e0b; font-weight:600;'>{pending}</span>
-            </div>
-            <div style='display:flex; justify-content:space-between; font-size:0.72rem;'>
-                <span style='color:#22c55e;'>Completed</span><span style='color:#22c55e; font-weight:600;'>{completed}</span>
-            </div>
-            <div style='display:flex; justify-content:space-between; font-size:0.72rem;'>
-                <span style='color:#ef4444;'>Rejected</span><span style='color:#ef4444; font-weight:600;'>{rejected}</span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        "Enter a customer complaint in the text box below. The app will analyze it, retrieve relevant policy excerpts, and generate a suggested policy-based resolution."
     )
 
-    st.divider()
-
-    # Ollama model selector
-    st.markdown("**⚙️ LLM Settings**")
-    model = st.selectbox(
-        "Ollama model",
-        options=["qwen3:8b", "qwen2.5:7b", "llama3.2:3b", "mistral:7b", "phi3:mini"],
-        index=0,
-        key="ollama_model",
-        help="Ensure this model is pulled in Ollama before use.",
+    complaint_text = st.text_area(
+        "Customer complaint text", height=240, placeholder="Enter the full complaint here..."
     )
-    st.caption("Run: `ollama pull qwen3:8b`")
+    analyze_button = st.button("Analyze Complaint")
 
-    st.markdown(
-        "<div style='font-size:0.7rem; color:var(--muted); margin-top:1rem;'>"
-        "All data is in-session only.<br/>Data resets on page reload."
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    if analyze_button:
+        if not complaint_text.strip():
+            st.warning("Please enter a complaint before clicking Analyze Complaint.")
+        elif not is_kb_ready():
+            st.warning("Knowledge base is empty. Please upload policy documents in the Knowledge Base tab first.")
+        else:
+            with st.spinner("Analyzing complaint and generating suggested resolution..."):
+                try:
+                    result = analyze_complaint(complaint_text)
+                    complaint_id = len(st.session_state.complaints) + 1
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    record = {
+                        "complaint_id": complaint_id,
+                        "complaint_text": complaint_text.strip(),
+                        "summary": result["summary"],
+                        "category": result["category"],
+                        "resolution": result["suggested_resolution"],
+                        "next_actions": result["next_actions"],
+                        "confidence": result["confidence_score"],
+                        "cited_sources": result["cited_sources"],
+                        "status": "Pending",
+                        "created_at": timestamp,
+                        "retrieved_chunks": result["retrieved_chunks"],
+                    }
+                    write_complaint_record(record)
 
-# ── Tabs ─────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "📚 Knowledge Base",
-        "🔍 Complaint Analysis",
-        "📋 Resolution Tracker",
-        "💬 Policy Chatbot",
+                    st.success("Complaint analyzed and stored successfully.")
+                    st.subheader("Analysis Result")
+                    st.markdown(f"**Complaint Summary:** {record['summary']}")
+                    st.markdown(f"**Complaint Category:** {record['category']}")
+                    st.markdown(f"**Suggested Resolution:** {record['resolution']}")
+                    st.markdown(f"**Recommended Next Actions:** {record['next_actions']}")
+                    st.markdown(f"**Confidence Score:** {record['confidence']}%")
+                    if record["cited_sources"]:
+                        st.markdown(
+                            "**Cited Source References:** "
+                            + ", ".join([f"Excerpt {src}" for src in record["cited_sources"]])
+                        )
+                    st.markdown("---")
+                    st.subheader("Retrieved Policy Snippets")
+                    for idx, chunk in enumerate(result["retrieved_chunks"], start=1):
+                        st.write(f"**Excerpt {idx} — {chunk['source']}**")
+                        st.write(chunk["text"])
+
+                except Exception as exc:
+                    st.error(f"Analysis failed: {exc}")
+
+    if st.session_state.complaints:
+        st.info("Past analyzed complaints are available in the Resolution Tracker tab.")
+
+
+def update_complaint_status(complaint_id: int, new_status: str) -> None:
+    for complaint in st.session_state.complaints:
+        if complaint["complaint_id"] == complaint_id:
+            complaint["status"] = new_status
+            st.success(f"Complaint {complaint_id} updated to {new_status}.")
+            return
+    st.error(f"Complaint {complaint_id} not found.")
+
+
+def delete_complaint(complaint_id: int) -> None:
+    st.session_state.complaints = [
+        c for c in st.session_state.complaints if c["complaint_id"] != complaint_id
     ]
-)
+    st.success(f"Complaint {complaint_id} deleted.")
 
-with tab1:
-    knowledge_base.render()
 
-with tab2:
-    complaint_analysis.render()
+def status_color(status: str) -> str:
+    if status == "Pending":
+        return "#F6C23E"
+    if status == "Completed":
+        return "#1CC88A"
+    if status == "Rejected":
+        return "#E74A3B"
+    return "#6C757D"
 
-with tab3:
-    resolution_tracker.render()
 
-with tab4:
-    policy_chatbot.render()
+def tab_resolution_tracker() -> None:
+    st.header("Resolution Tracker")
+    st.markdown("Track complaint progress, update statuses, and review analytics for all analyzed complaints.")
+
+    complaints = st.session_state.complaints
+    total = len(complaints)
+    pending = sum(1 for c in complaints if c["status"] == "Pending")
+    completed = sum(1 for c in complaints if c["status"] == "Completed")
+    rejected = sum(1 for c in complaints if c["status"] == "Rejected")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Complaints", total)
+    col2.metric("Pending", pending)
+    col3.metric("Completed", completed)
+    col4.metric("Rejected", rejected)
+
+    if total == 0:
+        st.info("No complaints have been analyzed yet. Use the Complaint Analysis tab to add complaints.")
+        return
+
+    chart_data = pd.DataFrame(
+        [{"Status": "Pending", "Count": pending},
+         {"Status": "Completed", "Count": completed},
+         {"Status": "Rejected", "Count": rejected}]
+    )
+    fig1, ax1 = plt.subplots()
+    ax1.pie(chart_data["Count"], labels=chart_data["Status"], autopct="%1.0f%%", colors=["#F6C23E", "#1CC88A", "#E74A3B"])
+    ax1.set_title("Complaint Status Distribution")
+    st.pyplot(fig1)
+
+    category_counts = pd.Series([c["category"] for c in complaints]).value_counts().reset_index()
+    category_counts.columns = ["Category", "Count"]
+    fig2, ax2 = plt.subplots(figsize=(8, 4))
+    ax2.bar(category_counts["Category"], category_counts["Count"], color="#4e73df")
+    ax2.set_title("Complaint Category Distribution")
+    ax2.set_xticklabels(category_counts["Category"], rotation=45, ha="right")
+    st.pyplot(fig2)
+
+    st.subheader("Complaint List")
+    for complaint in complaints:
+        card_color = status_color(complaint["status"])
+        with st.container():
+            st.markdown(
+                f"<div style='border:1px solid #ddd; padding: 12px; border-radius: 10px; background: #FFF;'>"
+                f"<strong>ID #{complaint['complaint_id']} — {complaint['category']}</strong><br>"
+                f"<span style='color:{card_color}; font-weight:700'>{complaint['status']}</span><br>"
+                f"<em>{complaint['summary']}</em><br>"
+                f"<strong>Created:</strong> {complaint['created_at']}"
+                f"</div>", unsafe_allow_html=True
+            )
+            cols = st.columns(4)
+            if cols[0].button("Mark Completed", key=f"complete_{complaint['complaint_id']}"):
+                update_complaint_status(complaint["complaint_id"], "Completed")
+            if cols[1].button("Mark Pending", key=f"pending_{complaint['complaint_id']}"):
+                update_complaint_status(complaint["complaint_id"], "Pending")
+            if cols[2].button("Mark Rejected", key=f"reject_{complaint['complaint_id']}"):
+                update_complaint_status(complaint["complaint_id"], "Rejected")
+            if cols[3].button("Delete", key=f"delete_{complaint['complaint_id']}"):
+                delete_complaint(complaint["complaint_id"])
+
+            with st.expander("View full complaint details"):
+                st.markdown(f"**Full Complaint:** {complaint['complaint_text']}")
+                st.markdown(f"**Suggested Resolution:** {complaint['resolution']}")
+                st.markdown(f"**Next Actions:** {complaint['next_actions']}")
+                st.markdown(f"**Confidence:** {complaint['confidence']}")
+                if complaint["cited_sources"]:
+                    st.markdown(
+                        "**Cited Source References:** "
+                        + ", ".join([f"Excerpt {src}" for src in complaint["cited_sources"]])
+                    )
+                st.markdown("---")
+
+
+def tab_ai_chatbot() -> None:
+    st.header("AI Policy Chatbot")
+    st.markdown("Ask policy-related questions and get answers grounded in the uploaded banking documents.")
+
+    question = st.text_input("Policy question", placeholder="What is the SOP for failed UPI transactions?")
+    ask_button = st.button("Ask Chatbot")
+
+    if ask_button:
+        if not question.strip():
+            st.warning("Please enter a question for the chatbot.")
+        elif not is_kb_ready():
+            st.warning("Knowledge base is empty. Upload policy documents first.")
+        else:
+            with st.spinner("Retrieving policy excerpts and generating an answer..."):
+                try:
+                    retrieved_chunks = retrieve_policy_chunks(question, top_k=3)
+                    if not retrieved_chunks:
+                        st.warning("No relevant policy excerpts were found for this question.")
+                    else:
+                        prompt = compose_chatbot_prompt(question, retrieved_chunks)
+                        model_name = st.session_state.knowledge_base.get("model_name") or "unknown"
+                        answer = run_ollama_generate(prompt, model_name, max_tokens=350)
+                        source_ids = [str(i + 1) for i in range(len(retrieved_chunks))]
+                        add_chat_history(question, answer, source_ids)
+                        st.subheader("Chatbot Answer")
+                        st.write(answer)
+                        st.markdown("**Cited Sources:** " + ", ".join([f"Excerpt {s}" for s in source_ids]))
+                        with st.expander("Retrieved Policy Excerpts"):
+                            for idx, chunk in enumerate(retrieved_chunks, start=1):
+                                st.write(f"**Excerpt {idx} — {chunk['source']}**")
+                                st.write(chunk["text"])
+                except Exception as exc:
+                    st.error(f"Chatbot failed: {exc}")
+
+    if st.session_state.chat_history:
+        st.subheader("Chat History")
+        for entry in reversed(st.session_state.chat_history[-8:]):
+            st.markdown(f"**{entry['timestamp']} — Question:** {entry['question']}")
+            st.write(entry["answer"])
+            st.markdown("**Sources:** " + ", ".join([f"Excerpt {s}" for s in entry["sources"]]))
+            st.markdown("---")
+
+
+def main() -> None:
+    st.set_page_config(page_title="ComplaintIQ", page_icon="💼", layout="wide")
+    initialize_session_state()
+
+    if st.session_state.knowledge_base.get("model_name") is None:
+        model_name = get_available_ollama_model()
+        st.session_state.knowledge_base["model_name"] = model_name
+
+    render_header()
+
+    tab = st.sidebar.radio(
+        "Navigation",
+        [
+            "Knowledge Base Management",
+            "Complaint Analysis",
+            "Resolution Tracker",
+            "AI Policy Chatbot",
+        ],
+    )
+
+    if tab == "Knowledge Base Management":
+        tab_knowledge_base()
+    elif tab == "Complaint Analysis":
+        tab_complaint_analysis()
+    elif tab == "Resolution Tracker":
+        tab_resolution_tracker()
+    elif tab == "AI Policy Chatbot":
+        tab_ai_chatbot()
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        "Built with local LLMs, FAISS, sentence-transformers, and Streamlit. "
+        "No cloud APIs are used."
+    )
+
+
+if __name__ == "__main__":
+    main()
